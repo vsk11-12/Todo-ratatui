@@ -1,3 +1,4 @@
+//This is a Simple TUI todo list manager based on rust built on the ratatui framework and  is inspired by the togo app available on aur
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{self};
@@ -23,6 +24,7 @@ pub enum AppMode {
     Normal,
     Filtering,
     Adding,
+    Renaming, // Added for renaming feature
     ConfirmDelete,
 }
 
@@ -35,10 +37,10 @@ pub struct App {
 }
 
 impl App {
-    // Resolves data file path to: ~/.config/togo/todos.json
+    // Resolves data file path to: ~/.config/todo/todos.json
     fn get_storage_path() -> Option<PathBuf> {
         dirs::config_dir().map(|mut path| {
-            path.push("todo");
+            path.push("togo");
             path.push("todos.json");
             path
         })
@@ -58,14 +60,26 @@ impl App {
         Vec::new()
     }
 
-    // Saves state back to the disk
+    // Saves state back to the disk atomically to prevent corruption
     pub fn save(&self) -> io::Result<()> {
         if let Some(path) = Self::get_storage_path() {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            let file = File::create(path)?;
-            serde_json::to_writer_pretty(file, &self.todos)?;
+
+            // 1. Create a temporary file path in the same directory
+            let mut temp_path = path.clone();
+            temp_path.set_extension("json.tmp");
+
+            // 2. Open and write to the temporary file
+            let file = File::create(&temp_path)?;
+            serde_json::to_writer_pretty(&file, &self.todos)?;
+
+            // 3. Ensure all OS buffers are fully flushed to actual hardware storage
+            file.sync_all()?;
+
+            // 4. Atomically rename the temporary file to the target path
+            fs::rename(&temp_path, path)?;
         }
         Ok(())
     }
@@ -146,11 +160,15 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             Span::styled("Add Task: ", Style::default().fg(Color::Green).bold()),
             Span::raw(&app.new_todo_query),
         ]),
+        AppMode::Renaming => Line::from(vec![
+            Span::styled("Rename Task: ", Style::default().fg(Color::Cyan).bold()),
+            Span::raw(&app.new_todo_query),
+        ]),
         AppMode::ConfirmDelete => Line::from(vec![
             Span::styled("Delete selected item? Are you sure? (y/n): ", Style::default().fg(Color::Red).bold()),
         ]),
         AppMode::Normal => Line::from(vec![
-            Span::styled(" [j/k] Nav | [space] Toggle | [a] Add | [d] Delete | [/] Filter | [q] Quit", Style::default().fg(Color::DarkGray)),
+            Span::styled(" [j/k] Nav | [Shift+J/K] Move | [space] Toggle | [a] Add | [r] Rename | [d] Delete | [/] Filter | [q] Quit", Style::default().fg(Color::DarkGray)),
         ]),
     };
 
@@ -165,14 +183,17 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
     // 5. Calculate and place the blinking terminal cursor dynamically based on active typing context
     match app.mode {
         AppMode::Adding => {
-            // "Add Task: " has a character length of 10
             let cursor_x = chunks[1].x + 10 + app.new_todo_query.chars().count() as u16;
-            // The text line is drawn 1 row below the top border of chunk[1]
+            let cursor_y = chunks[1].y + 1;
+            frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+        }
+        AppMode::Renaming => {
+            // "Rename Task: " has a length of 13 characters
+            let cursor_x = chunks[1].x + 13 + app.new_todo_query.chars().count() as u16;
             let cursor_y = chunks[1].y + 1;
             frame.set_cursor_position(Position::new(cursor_x, cursor_y));
         }
         AppMode::Filtering => {
-            // "Filter: " has a character length of 8
             let cursor_x = chunks[1].x + 8 + app.search_query.chars().count() as u16;
             let cursor_y = chunks[1].y + 1;
             frame.set_cursor_position(Position::new(cursor_x, cursor_y));
@@ -236,6 +257,26 @@ fn main() -> io::Result<()> {
                         KeyCode::Char(c) => { app.new_todo_query.push(c); }
                         _ => {}
                     },
+                    AppMode::Renaming => match key.code {
+                        KeyCode::Esc => {
+                            app.new_todo_query.clear();
+                            app.mode = AppMode::Normal;
+                        }
+                        KeyCode::Enter => {
+                            if !app.new_todo_query.trim().is_empty() {
+                                let filtered = app.filtered_indices();
+                                if let Some(&actual_idx) = filtered.get(app.selected_index) {
+                                    app.todos[actual_idx].text = app.new_todo_query.trim().to_string();
+                                    app.save()?;
+                                }
+                                app.new_todo_query.clear();
+                                app.mode = AppMode::Normal;
+                            }
+                        }
+                        KeyCode::Backspace => { app.new_todo_query.pop(); }
+                        KeyCode::Char(c) => { app.new_todo_query.push(c); }
+                        _ => {}
+                    },
                     AppMode::ConfirmDelete => match key.code {
                         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                             let filtered = app.filtered_indices();
@@ -262,6 +303,30 @@ fn main() -> io::Result<()> {
                                 app.selected_index -= 1;
                             }
                         }
+                        // Shift + J to move down
+                        KeyCode::Char('J') => {
+                            if current_filtered_len > 0 && app.selected_index < max_index {
+                                let filtered = app.filtered_indices();
+                                let current_actual_idx = filtered[app.selected_index];
+                                let target_actual_idx = filtered[app.selected_index + 1];
+                                
+                                app.todos.swap(current_actual_idx, target_actual_idx);
+                                app.selected_index += 1;
+                                app.save()?;
+                            }
+                        }
+                        // Shift + K to move up
+                        KeyCode::Char('K') => {
+                            if current_filtered_len > 0 && app.selected_index > 0 {
+                                let filtered = app.filtered_indices();
+                                let current_actual_idx = filtered[app.selected_index];
+                                let target_actual_idx = filtered[app.selected_index - 1];
+                                
+                                app.todos.swap(current_actual_idx, target_actual_idx);
+                                app.selected_index -= 1;
+                                app.save()?;
+                            }
+                        }
                         KeyCode::Char(' ') => {
                             let filtered = app.filtered_indices();
                             if let Some(&actual_idx) = filtered.get(app.selected_index) {
@@ -274,6 +339,13 @@ fn main() -> io::Result<()> {
                         }
                         KeyCode::Char('a') => {
                             app.mode = AppMode::Adding;
+                        }
+                        KeyCode::Char('r') => {
+                            let filtered = app.filtered_indices();
+                            if let Some(&actual_idx) = filtered.get(app.selected_index) {
+                                app.new_todo_query = app.todos[actual_idx].text.clone();
+                                app.mode = AppMode::Renaming;
+                            }
                         }
                         KeyCode::Char('d') => {
                             if current_filtered_len > 0 {
