@@ -1,15 +1,18 @@
-//This is a Simple TUI todo list manager based on rust built on the ratatui framework and  is inspired by the togo app available on aur
+// Simple TUI todo list manager built on Rust with the Ratatui framework
+// Inspired by the togo app on aur
+// Built and maintained by vsk11-12
+
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{self};
 use std::path::PathBuf;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Position},
-    style::{Color, Modifier, Style},
+    layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
+    style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
-    Frame,
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    DefaultTerminal, Frame,
 };
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -24,7 +27,7 @@ pub enum AppMode {
     Normal,
     Filtering,
     Adding,
-    Renaming, // Added for renaming feature
+    Renaming,
     ConfirmDelete,
 }
 
@@ -37,7 +40,7 @@ pub struct App {
 }
 
 impl App {
-    // Resolves data file path to: ~/.config/todo/todos.json
+    // Resolves data file path to: ~/.config/togo/todos.json
     fn get_storage_path() -> Option<PathBuf> {
         dirs::config_dir().map(|mut path| {
             path.push("togo");
@@ -67,18 +70,13 @@ impl App {
                 fs::create_dir_all(parent)?;
             }
 
-            // 1. Create a temporary file path in the same directory
             let mut temp_path = path.clone();
             temp_path.set_extension("json.tmp");
 
-            // 2. Open and write to the temporary file
             let file = File::create(&temp_path)?;
             serde_json::to_writer_pretty(&file, &self.todos)?;
 
-            // 3. Ensure all OS buffers are fully flushed to actual hardware storage
             file.sync_all()?;
-
-            // 4. Atomically rename the temporary file to the target path
             fs::rename(&temp_path, path)?;
         }
         Ok(())
@@ -86,20 +84,41 @@ impl App {
 
     // Filters visible items based on search queries
     pub fn filtered_indices(&self) -> Vec<usize> {
+        let lower_search = self.search_query.to_lowercase();
         self.todos
             .iter()
             .enumerate()
             .filter(|(_, todo)| {
-                !todo.archived && 
-                todo.text.to_lowercase().contains(&self.search_query.to_lowercase())
+                !todo.archived && todo.text.to_lowercase().contains(&lower_search)
             })
             .map(|(idx, _)| idx)
             .collect()
     }
 }
 
-pub fn ui(frame: &mut Frame, app: &mut App) {
-    // 1. App-wide outer boundary block with centered title string
+/// Helper function to create a centered rect layout for popups
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
+pub fn ui(frame: &mut Frame, app: &mut App, filtered_indices: &[usize]) {
+    // 1. App-wide outer boundary block
     let outer_block = Block::default()
         .borders(Borders::ALL)
         .title(" To-Do List ")
@@ -109,7 +128,7 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
     let area = outer_block.inner(frame.area());
     frame.render_widget(outer_block, frame.area());
 
-    // 2. Split inner content space (leaving exactly 2 rows at the bottom for hints)
+    // 2. Split inner content space (allocating exactly 2 rows at the bottom for instructions)
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -118,7 +137,6 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         ])
         .split(area);
 
-    let filtered_indices = app.filtered_indices();
     let mut list_items = Vec::new();
 
     for (display_idx, &actual_idx) in filtered_indices.iter().enumerate() {
@@ -150,29 +168,47 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
     let todo_list = List::new(list_items);
     frame.render_widget(todo_list, chunks[0]);
 
-    // 3. Render contextual context action prompts dynamically
+    // Render a scrollbar if items go beyond viewport bounds
+    let mut scrollbar_state = ScrollbarState::new(filtered_indices.len()).position(app.selected_index);
+    frame.render_stateful_widget(
+        Scrollbar::default()
+            .orientation(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("↑"))
+            .end_symbol(Some("↓")),
+        chunks[0],
+        &mut scrollbar_state,
+    );
+
+    // 3. Render context action prompts dynamically at the bottom status bar
     let prompt_text = match app.mode {
-        AppMode::Filtering => Line::from(vec![
-            Span::styled("Filter: ", Style::default().fg(Color::Magenta).bold()),
-            Span::raw(&app.search_query),
-        ]),
+        AppMode::Filtering => {
+            let max_width = chunks[1].width.saturating_sub(10) as usize;
+            let query_len = app.search_query.chars().count();
+            let scrolled_query: String = if query_len >= max_width {
+                app.search_query.chars().skip(query_len - max_width + 1).collect()
+            } else {
+                app.search_query.clone()
+            };
+            Line::from(vec![
+                Span::styled("Filter: ", Style::default().fg(Color::Magenta).bold()),
+                Span::raw(scrolled_query),
+            ])
+        }
         AppMode::Adding => Line::from(vec![
-            Span::styled("Add Task: ", Style::default().fg(Color::Green).bold()),
-            Span::raw(&app.new_todo_query),
+            Span::styled(" Adding item... ", Style::default().fg(Color::Green).bold()),
         ]),
         AppMode::Renaming => Line::from(vec![
-            Span::styled("Rename Task: ", Style::default().fg(Color::Cyan).bold()),
-            Span::raw(&app.new_todo_query),
+            Span::styled(" Renaming item...", Style::default().fg(Color::Cyan).bold()),
         ]),
         AppMode::ConfirmDelete => Line::from(vec![
-            Span::styled("Delete selected item? Are you sure? (y/n): ", Style::default().fg(Color::Red).bold()),
+            Span::styled(" Deleting item... ", Style::default().fg(Color::Red).bold()),
         ]),
         AppMode::Normal => Line::from(vec![
-            Span::styled(" [j/k] Nav | [Shift+J/K] Move | [space] Toggle | [a] Add | [r] Rename | [d] Delete | [/] Filter | [q] Quit", Style::default().fg(Color::DarkGray)),
+            Span::styled(" [j/k] Nav | [Shift+J/K] Move | [space] Toggle | [i] Add | [r] Rename | [d] Delete | [/] Filter | [q] Quit", Style::default().fg(Color::DarkGray)),
         ]),
     };
 
-    // 4. Horizontal crisp line separator using a targeted top border layout block
+    // 4. Horizontal layout separator line
     let hint_block = Block::default()
         .borders(Borders::TOP)
         .border_style(Style::default().fg(Color::DarkGray));
@@ -180,25 +216,72 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
     let prompt = Paragraph::new(prompt_text).block(hint_block);
     frame.render_widget(prompt, chunks[1]);
 
-    // 5. Calculate and place the blinking terminal cursor dynamically based on active typing context
+    // 5. Render Modal Popups
     match app.mode {
-        AppMode::Adding => {
-            let cursor_x = chunks[1].x + 10 + app.new_todo_query.chars().count() as u16;
-            let cursor_y = chunks[1].y + 1;
+        AppMode::Adding | AppMode::Renaming => {
+            let popup_area = centered_rect(60, 20, frame.area());
+            frame.render_widget(Clear, popup_area);
+
+            let (title, color) = if app.mode == AppMode::Adding {
+                (" Add New Task ", Color::Green)
+            } else {
+                (" Rename Task ", Color::Cyan)
+            };
+
+            let popup_block = Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(color));
+            
+            // Calculate a horizontal scrolling sliding-window for text boxes
+            let max_input_width = popup_area.width.saturating_sub(2) as usize;
+            let current_len = app.new_todo_query.chars().count();
+            let viewable_text: String = if current_len >= max_input_width {
+                app.new_todo_query.chars().skip(current_len - max_input_width + 1).collect()
+            } else {
+                app.new_todo_query.clone()
+            };
+
+            let popup_paragraph = Paragraph::new(viewable_text.as_str()).block(popup_block);
+            frame.render_widget(popup_paragraph, popup_area);
+
+            // Dynamically clip cursor position safely inside boundaries
+            let cursor_x = popup_area.x + 1 + viewable_text.chars().count() as u16;
+            let cursor_y = popup_area.y + 1;
             frame.set_cursor_position(Position::new(cursor_x, cursor_y));
         }
-        AppMode::Renaming => {
-            // "Rename Task: " has a length of 13 characters
-            let cursor_x = chunks[1].x + 13 + app.new_todo_query.chars().count() as u16;
-            let cursor_y = chunks[1].y + 1;
-            frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+        AppMode::ConfirmDelete => {
+            let popup_area = centered_rect(50, 25, frame.area());
+            frame.render_widget(Clear, popup_area);
+
+            let popup_block = Block::default()
+                .title(" Confirmation ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red));
+
+            let message = vec![
+                Line::from(""),
+                Line::from("Are you sure you want to delete?".bold()),
+                Line::from(""),
+                Line::from("  [y] Yes  |  [n] Cancel  ".dark_gray()),
+            ];
+            
+            let popup_paragraph = Paragraph::new(message)
+                .alignment(Alignment::Center)
+                .block(popup_block);
+            
+            frame.render_widget(popup_paragraph, popup_area);
         }
         AppMode::Filtering => {
-            let cursor_x = chunks[1].x + 8 + app.search_query.chars().count() as u16;
+            let max_width = chunks[1].width.saturating_sub(10) as usize;
+            let query_len = app.search_query.chars().count();
+            let cursor_offset = if query_len >= max_width { max_width - 1 } else { query_len };
+            
+            let cursor_x = chunks[1].x + 8 + cursor_offset as u16;
             let cursor_y = chunks[1].y + 1;
             frame.set_cursor_position(Position::new(cursor_x, cursor_y));
         }
-        _ => {} // No active cursor for normal or delete mode
+        _ => {}
     }
 }
 
@@ -213,20 +296,31 @@ fn main() -> io::Result<()> {
         mode: AppMode::Normal,
     };
 
+    // Execute application loop logic wrapped inside error isolation
+    let result = run_app(&mut terminal, &mut app);
+
+    // Always clean up raw terminal state back to the user shell regardless of app crashes
+    ratatui::restore();
+    result
+}
+
+fn run_app(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
     loop {
-        let filtered_len = app.filtered_indices().len();
+        // Cache filtered list indexing configurations once per rendering pass
+        let filtered_indices = app.filtered_indices();
+        let filtered_len = filtered_indices.len();
+        
         if filtered_len == 0 {
             app.selected_index = 0;
         } else if app.selected_index >= filtered_len {
             app.selected_index = filtered_len - 1;
         }
 
-        terminal.draw(|f| ui(f, &mut app))?;
+        terminal.draw(|f| ui(f, app, &filtered_indices))?;
 
         if let Event::Key(key) = event::read()? {
             if key.kind == KeyEventKind::Press {
-                let current_filtered_len = app.filtered_indices().len();
-                let max_index = current_filtered_len.saturating_sub(1);
+                let max_index = filtered_len.saturating_sub(1);
 
                 match app.mode {
                     AppMode::Filtering => match key.code {
@@ -249,6 +343,7 @@ fn main() -> io::Result<()> {
                                 });
                                 app.new_todo_query.clear();
                                 app.mode = AppMode::Normal;
+                                // Automatically jump focus to the newly appended item
                                 app.selected_index = app.filtered_indices().len().saturating_sub(1);
                                 app.save()?;
                             }
@@ -264,8 +359,7 @@ fn main() -> io::Result<()> {
                         }
                         KeyCode::Enter => {
                             if !app.new_todo_query.trim().is_empty() {
-                                let filtered = app.filtered_indices();
-                                if let Some(&actual_idx) = filtered.get(app.selected_index) {
+                                if let Some(&actual_idx) = filtered_indices.get(app.selected_index) {
                                     app.todos[actual_idx].text = app.new_todo_query.trim().to_string();
                                     app.save()?;
                                 }
@@ -279,8 +373,7 @@ fn main() -> io::Result<()> {
                     },
                     AppMode::ConfirmDelete => match key.code {
                         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                            let filtered = app.filtered_indices();
-                            if let Some(&actual_idx) = filtered.get(app.selected_index) {
+                            if let Some(&actual_idx) = filtered_indices.get(app.selected_index) {
                                 app.todos.remove(actual_idx);
                                 app.save()?;
                             }
@@ -294,7 +387,7 @@ fn main() -> io::Result<()> {
                     AppMode::Normal => match key.code {
                         KeyCode::Char('q') => break,
                         KeyCode::Char('j') | KeyCode::Down => {
-                            if current_filtered_len > 0 && app.selected_index < max_index {
+                            if filtered_len > 0 && app.selected_index < max_index {
                                 app.selected_index += 1;
                             }
                         }
@@ -303,24 +396,22 @@ fn main() -> io::Result<()> {
                                 app.selected_index -= 1;
                             }
                         }
-                        // Shift + J to move down
+                        // Shift + J to move items down
                         KeyCode::Char('J') => {
-                            if current_filtered_len > 0 && app.selected_index < max_index {
-                                let filtered = app.filtered_indices();
-                                let current_actual_idx = filtered[app.selected_index];
-                                let target_actual_idx = filtered[app.selected_index + 1];
+                            if filtered_len > 0 && app.selected_index < max_index {
+                                let current_actual_idx = filtered_indices[app.selected_index];
+                                let target_actual_idx = filtered_indices[app.selected_index + 1];
                                 
                                 app.todos.swap(current_actual_idx, target_actual_idx);
                                 app.selected_index += 1;
                                 app.save()?;
                             }
                         }
-                        // Shift + K to move up
+                        // Shift + K to move items up
                         KeyCode::Char('K') => {
-                            if current_filtered_len > 0 && app.selected_index > 0 {
-                                let filtered = app.filtered_indices();
-                                let current_actual_idx = filtered[app.selected_index];
-                                let target_actual_idx = filtered[app.selected_index - 1];
+                            if filtered_len > 0 && app.selected_index > 0 {
+                                let current_actual_idx = filtered_indices[app.selected_index];
+                                let target_actual_idx = filtered_indices[app.selected_index - 1];
                                 
                                 app.todos.swap(current_actual_idx, target_actual_idx);
                                 app.selected_index -= 1;
@@ -328,8 +419,7 @@ fn main() -> io::Result<()> {
                             }
                         }
                         KeyCode::Char(' ') => {
-                            let filtered = app.filtered_indices();
-                            if let Some(&actual_idx) = filtered.get(app.selected_index) {
+                            if let Some(&actual_idx) = filtered_indices.get(app.selected_index) {
                                 app.todos[actual_idx].completed = !app.todos[actual_idx].completed;
                                 app.save()?;
                             }
@@ -337,18 +427,17 @@ fn main() -> io::Result<()> {
                         KeyCode::Char('/') => {
                             app.mode = AppMode::Filtering;
                         }
-                        KeyCode::Char('a') => {
+                        KeyCode::Char('i') => {
                             app.mode = AppMode::Adding;
                         }
                         KeyCode::Char('r') => {
-                            let filtered = app.filtered_indices();
-                            if let Some(&actual_idx) = filtered.get(app.selected_index) {
+                            if let Some(&actual_idx) = filtered_indices.get(app.selected_index) {
                                 app.new_todo_query = app.todos[actual_idx].text.clone();
                                 app.mode = AppMode::Renaming;
                             }
                         }
                         KeyCode::Char('d') => {
-                            if current_filtered_len > 0 {
+                            if filtered_len > 0 {
                                 app.mode = AppMode::ConfirmDelete;
                             }
                         }
@@ -358,7 +447,5 @@ fn main() -> io::Result<()> {
             }
         }
     }
-
-    ratatui::restore();
     Ok(())
 }
