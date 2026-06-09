@@ -43,7 +43,7 @@ impl App {
     // Resolves data file path to: ~/.config/togo/todos.json
     fn get_storage_path() -> Option<PathBuf> {
         dirs::config_dir().map(|mut path| {
-            path.push("togo");
+            path.push("todo");
             path.push("todos.json");
             path
         })
