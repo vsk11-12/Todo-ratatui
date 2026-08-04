@@ -1,12 +1,12 @@
 // Simple TUI todo list manager built on Rust with the Ratatui framework
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{
-        Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
-        ScrollbarState,
+        Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph, Scrollbar,
+        ScrollbarOrientation, ScrollbarState,
     },
     DefaultTerminal, Frame,
 };
@@ -15,7 +15,7 @@ use serde_json::Value;
 use std::fs::{self, File};
 use std::io::{self};
 use std::path::PathBuf;
-use chrono::{NaiveDate, NaiveDateTime, Local};
+use chrono::{NaiveDate, NaiveDateTime, Local, Datelike};
 
 // ---------------------------------------------------------------------------
 // Theme & Color Parsing
@@ -151,6 +151,7 @@ pub struct App {
     pub mode: AppMode,
     pub theme: Theme,
     pub notifications_enabled: bool,
+    pub calendar_date: NaiveDate,
 }
 
 impl App {
@@ -270,6 +271,23 @@ impl App {
     }
 }
 
+fn add_months(date: NaiveDate, months: i32) -> NaiveDate {
+    let mut year = date.year();
+    let mut month = date.month() as i32 + months;
+    while month > 12 {
+        month -= 12;
+        year += 1;
+    }
+    while month < 1 {
+        month += 12;
+        year -= 1;
+    }
+    let next_month_first = NaiveDate::from_ymd_opt(if month == 12 { year + 1 } else { year }, if month == 12 { 1 } else { (month as u32) + 1 }, 1).unwrap();
+    let days_in_target_month = (next_month_first - chrono::Duration::days(1)).day();
+    let day = date.day().min(days_in_target_month);
+    NaiveDate::from_ymd_opt(year, month as u32, day).unwrap_or(date)
+}
+
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -290,12 +308,100 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
+fn render_calendar(date: NaiveDate, theme: &Theme) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+
+    let month_name = date.format("%B %Y").to_string();
+    lines.push(Line::from(Span::styled(
+        format!("--- {} ---", month_name),
+        Style::default().fg(theme.title).bold(),
+    )));
+    lines.push(Line::from(""));
+
+    lines.push(Line::from(Span::styled(
+        " Mo Tu We Th Fr Sa Su ",
+        Style::default().fg(theme.shortcut_hint).bold(),
+    )));
+
+    let year = date.year();
+    let month = date.month();
+
+    let first_of_month = NaiveDate::from_ymd_opt(year, month, 1).unwrap();
+    let start_weekday = first_of_month.weekday().number_from_monday();
+
+    let next_month = if month == 12 {
+        NaiveDate::from_ymd_opt(year + 1, 1, 1).unwrap()
+    } else {
+        NaiveDate::from_ymd_opt(year, month + 1, 1).unwrap()
+    };
+    let last_date = next_month - chrono::Duration::days(1);
+    let total_days = last_date.day() as i32;
+
+    let mut current_line_spans = Vec::new();
+    for _ in 1..start_weekday {
+        current_line_spans.push(Span::raw("   "));
+    }
+
+    let mut current_day_of_week = start_weekday;
+
+    for day in 1..=total_days {
+        let current_date = NaiveDate::from_ymd_opt(year, month, day as u32).unwrap();
+        let is_selected = current_date == date;
+        let is_today = current_date == Local::now().date_naive();
+
+        let day_str = format!("{:2} ", day);
+        let style = if is_selected {
+            Style::default().fg(theme.selected).bg(Color::Rgb(60, 60, 60)).bold()
+        } else if is_today {
+            Style::default().fg(theme.status_checked).bold()
+        } else {
+            Style::default().fg(theme.normal_text)
+        };
+
+        current_line_spans.push(Span::styled(day_str, style));
+
+        if current_day_of_week == 7 {
+            lines.push(Line::from(current_line_spans));
+            current_line_spans = Vec::new();
+            current_day_of_week = 1;
+        } else {
+            current_day_of_week += 1;
+        }
+    }
+
+    if !current_line_spans.is_empty() {
+        lines.push(Line::from(current_line_spans));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "h/j/k/l move | Shift+h/l month | Enter save | c clear | Esc cancel",
+        Style::default().fg(theme.shortcut_hint).italic(),
+    )));
+
+    lines
+}
+
 pub fn ui(frame: &mut Frame, app: &mut App, filtered_indices: &[usize]) {
+    let done_count = filtered_indices
+        .iter()
+        .filter(|&&i| app.todos[i].completed)
+        .count();
+    let total_count = filtered_indices.len();
+
+    let title = format!(" To-Do List - {done_count}/{total_count} done ");
+    let border_color = match app.mode {
+        AppMode::Filtering => app.theme.mode_filtering,
+        _ => app.theme.border,
+    };
+
     let outer_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(app.theme.border))
-        .title(Span::styled(" To-Do List ", Style::default().fg(app.theme.title)))
-        .title_alignment(Alignment::Center);
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color))
+        .title(Span::styled(title, Style::default().fg(app.theme.title).bold()))
+        .title_alignment(Alignment::Center)
+        .padding(Padding::horizontal(1));
 
     let area = outer_block.inner(frame.area());
     frame.render_widget(outer_block, frame.area());
@@ -305,75 +411,97 @@ pub fn ui(frame: &mut Frame, app: &mut App, filtered_indices: &[usize]) {
         .constraints([Constraint::Min(1), Constraint::Length(2)])
         .split(area);
 
-    let mut list_items = Vec::new();
-
-    for (display_idx, &actual_idx) in filtered_indices.iter().enumerate() {
-        let todo = &app.todos[actual_idx];
-        let status = if todo.completed { "[x]" } else { "[ ]" };
-        let status_color = if todo.completed {
-            app.theme.status_checked
+    if filtered_indices.is_empty() {
+        let empty_msg = if app.search_query.is_empty() {
+            "No tasks yet - press [i] to add one"
         } else {
-            app.theme.status_unchecked
+            "No tasks match your filter"
         };
+        let empty_para = Paragraph::new(Line::from(Span::styled(
+            empty_msg,
+            Style::default().fg(app.theme.shortcut_hint).italic(),
+        )))
+        .alignment(Alignment::Center);
+        let vcenter = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(45), Constraint::Length(1), Constraint::Min(0)])
+            .split(chunks[0]);
+        frame.render_widget(empty_para, vcenter[1]);
+    } else {
+        let mut list_items = Vec::with_capacity(filtered_indices.len());
 
-        let due_display = if let Some(ref date) = todo.due_date {
-            format!(" [Due: {}]", date)
-        } else {
-            String::new()
-        };
+        for (display_idx, &actual_idx) in filtered_indices.iter().enumerate() {
+            let todo = &app.todos[actual_idx];
+            let is_selected = display_idx == app.selected_index;
 
-        let line_content = if display_idx == app.selected_index {
-            let text_style = if todo.completed {
-                Style::default().fg(app.theme.completed).add_modifier(Modifier::CROSSED_OUT)
+            let status = if todo.completed { "[x]" } else { "[ ]" };
+            let status_color = if todo.completed {
+                app.theme.status_checked
             } else {
-                Style::default().fg(app.theme.selected)
+                app.theme.status_unchecked
             };
 
-            Line::from(vec![
-                Span::styled(
-                    format!("> {}. ", display_idx + 1),
-                    Style::default().fg(app.theme.selected).bold(),
-                ),
-                Span::styled(format!("{} ", status), Style::default().fg(status_color)),
-                Span::styled(&todo.text, text_style),
-                Span::styled(due_display, Style::default().fg(app.theme.due_date_text)),
-            ])
-        } else {
+            let marker = if is_selected { ">" } else { " " };
+            let marker_style = Style::default().fg(app.theme.selected);
+
             let text_style = if todo.completed {
-                Style::default().fg(app.theme.completed).add_modifier(Modifier::CROSSED_OUT)
+                Style::default()
+                    .fg(app.theme.completed)
+                    .add_modifier(Modifier::CROSSED_OUT)
+            } else if is_selected {
+                Style::default().fg(app.theme.selected).bold()
             } else {
                 Style::default().fg(app.theme.normal_text)
             };
 
-            Line::from(vec![
+            let index_width = filtered_indices.len().to_string().len();
+
+            let mut spans = vec![
+                Span::styled(format!("{marker} "), marker_style),
                 Span::styled(
-                    format!("  {}. ", display_idx + 1),
+                    format!("{:>width$}. ", display_idx + 1, width = index_width),
                     Style::default().fg(app.theme.normal_text),
                 ),
-                Span::styled(format!("{} ", status), Style::default().fg(status_color)),
-                Span::styled(&todo.text, text_style),
-                Span::styled(due_display, Style::default().fg(app.theme.due_date_text)),
-            ])
-        };
+                Span::styled(format!("{status} "), Style::default().fg(status_color)),
+                Span::styled(todo.text.clone(), text_style),
+            ];
 
-        list_items.push(ListItem::new(line_content));
+            if let Some(ref date) = todo.due_date {
+                spans.push(Span::styled(
+                    format!("  [Due: {date}]"),
+                    Style::default().fg(app.theme.due_date_text),
+                ));
+            }
+
+            let line = Line::from(spans);
+            let item_style = if is_selected {
+                Style::default().bg(Color::Rgb(38, 38, 38))
+            } else {
+                Style::default()
+            };
+
+            list_items.push(ListItem::new(line).style(item_style));
+        }
+
+        let todo_list = List::new(list_items);
+        frame.render_widget(todo_list, chunks[0]);
+
+        if filtered_indices.len() as u16 > chunks[0].height {
+            let mut scrollbar_state =
+                ScrollbarState::new(filtered_indices.len()).position(app.selected_index);
+            frame.render_stateful_widget(
+                Scrollbar::default()
+                    .orientation(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(Some("^"))
+                    .end_symbol(Some("v"))
+                    .style(Style::default().fg(app.theme.border)),
+                chunks[0],
+                &mut scrollbar_state,
+            );
+        }
     }
 
-    let todo_list = List::new(list_items);
-    frame.render_widget(todo_list, chunks[0]);
-
-    let mut scrollbar_state = ScrollbarState::new(filtered_indices.len()).position(app.selected_index);
-    frame.render_stateful_widget(
-        Scrollbar::default()
-            .orientation(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(Some("↑"))
-            .end_symbol(Some("↓"))
-            .style(Style::default().fg(app.theme.border)),
-        chunks[0],
-        &mut scrollbar_state,
-    );
-
-    let notif_status = if app.notifications_enabled { "ON" } else { "OFF" };
+    let notif_status = if app.notifications_enabled { "on" } else { "off" };
     let prompt_text = match app.mode {
         AppMode::Filtering => {
             let max_width = chunks[1].width.saturating_sub(10) as usize;
@@ -384,57 +512,73 @@ pub fn ui(frame: &mut Frame, app: &mut App, filtered_indices: &[usize]) {
                 app.search_query.clone()
             };
             Line::from(vec![
-                Span::styled("Filter: ", Style::default().fg(app.theme.mode_filtering).bold()),
+                Span::styled(" Filter: ", Style::default().fg(app.theme.mode_filtering).bold()),
                 Span::raw(scrolled_query),
             ])
         }
-        AppMode::Adding => Line::from(vec![
-            Span::styled(" Adding item... ", Style::default().fg(app.theme.mode_adding).bold()),
-        ]),
-        AppMode::Renaming => Line::from(vec![
-            Span::styled(" Renaming item...", Style::default().fg(app.theme.mode_renaming).bold()),
-        ]),
-        AppMode::SettingDueDate => Line::from(vec![
-            Span::styled(" Set Due Date (YYYY-MM-DD): ", Style::default().fg(app.theme.mode_due).bold()),
-        ]),
-        AppMode::ConfirmDelete => Line::from(vec![
-            Span::styled(" Deleting item... ", Style::default().fg(app.theme.mode_deleting).bold()),
-        ]),
-        AppMode::ConfirmQuit => Line::from(vec![
-            Span::styled(" Quitting... ", Style::default().fg(app.theme.mode_deleting).bold()),
-        ]),
-        AppMode::Normal => Line::from(vec![
-            Span::styled(
-                format!(" [j/k] Nav | [space] Toggle | [i] Add | [r] Rename | [D] Due | [N] Notifs: {} | [q] Quit", notif_status),
-                Style::default().fg(app.theme.shortcut_hint),
+        AppMode::Adding => Line::from(vec![Span::styled(
+            " Adding a new task...",
+            Style::default().fg(app.theme.mode_adding).bold(),
+        )]),
+        AppMode::Renaming => Line::from(vec![Span::styled(
+            " Renaming task...",
+            Style::default().fg(app.theme.mode_renaming).bold(),
+        )]),
+        AppMode::SettingDueDate => Line::from(vec![Span::styled(
+            " Selecting due date via calendar...",
+            Style::default().fg(app.theme.mode_due).bold(),
+        )]),
+        AppMode::ConfirmDelete => Line::from(vec![Span::styled(
+            " Confirm deletion...",
+            Style::default().fg(app.theme.mode_deleting).bold(),
+        )]),
+        AppMode::ConfirmQuit => Line::from(vec![Span::styled(
+            " Confirm quit...",
+            Style::default().fg(app.theme.mode_deleting).bold(),
+        )]),
+        AppMode::Normal => Line::from(vec![Span::styled(
+            format!(
+                " j/k move | space toggle | i add | r rename | D due | J/K reorder | / filter | N notifs:{notif_status} | q quit"
             ),
-        ]),
+            Style::default().fg(app.theme.shortcut_hint),
+        )]),
     };
 
     let hint_block = Block::default()
         .borders(Borders::TOP)
+        .border_type(BorderType::Plain)
         .border_style(Style::default().fg(app.theme.border));
 
     let prompt = Paragraph::new(prompt_text).block(hint_block);
     frame.render_widget(prompt, chunks[1]);
 
     match app.mode {
-        AppMode::Adding | AppMode::Renaming | AppMode::SettingDueDate => {
+        AppMode::Adding | AppMode::Renaming => {
             let popup_area = centered_rect(60, 20, frame.area());
             frame.render_widget(Clear, popup_area);
 
             let (title, color) = match app.mode {
                 AppMode::Adding => (" Add New Task ", app.theme.mode_adding),
-                AppMode::Renaming => (" Rename Task ", app.theme.mode_renaming),
-                _ => (" Set Due Date (YYYY-MM-DD) ", app.theme.mode_due),
+                _ => (" Rename Task ", app.theme.mode_renaming),
             };
 
             let popup_block = Block::default()
-                .title(Span::styled(title, Style::default().fg(color)))
+                .title(Span::styled(title, Style::default().fg(color).bold()))
+                .title_alignment(Alignment::Center)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(color));
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(color))
+                .padding(Padding::horizontal(1));
 
-            let max_input_width = popup_area.width.saturating_sub(2) as usize;
+            let inner = popup_block.inner(popup_area);
+            frame.render_widget(popup_block, popup_area);
+
+            let field_layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(0)])
+                .split(inner);
+
+            let max_input_width = field_layout[0].width as usize;
             let skip_count = if app.cursor_position >= max_input_width {
                 app.cursor_position - max_input_width + 1
             } else {
@@ -448,33 +592,70 @@ pub fn ui(frame: &mut Frame, app: &mut App, filtered_indices: &[usize]) {
                 .take(max_input_width)
                 .collect();
 
-            let popup_paragraph = Paragraph::new(viewable_text.as_str()).block(popup_block);
-            frame.render_widget(popup_paragraph, popup_area);
+            let input_line = Line::from(vec![Span::styled(
+                viewable_text.as_str(),
+                Style::default().fg(app.theme.normal_text),
+            )]);
+            let input_para = Paragraph::new(input_line);
+            frame.render_widget(input_para, field_layout[0]);
+
+            let hint_para = Paragraph::new(Line::from(Span::styled(
+                "Enter confirm | Esc cancel",
+                Style::default().fg(app.theme.shortcut_hint).italic(),
+            )));
+            frame.render_widget(hint_para, field_layout[1]);
 
             let visual_cursor_offset = (app.cursor_position - skip_count) as u16;
-            let cursor_x = popup_area.x + 1 + visual_cursor_offset;
-            let cursor_y = popup_area.y + 1;
+            let cursor_x = field_layout[0].x + visual_cursor_offset;
+            let cursor_y = field_layout[0].y;
             frame.set_cursor_position(Position::new(cursor_x, cursor_y));
         }
+        AppMode::SettingDueDate => {
+            let popup_area = centered_rect(34, 45, frame.area());
+            frame.render_widget(Clear, popup_area);
+
+            let popup_block = Block::default()
+                .title(Span::styled(" Select Due Date ", Style::default().fg(app.theme.mode_due).bold()))
+                .title_alignment(Alignment::Center)
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(app.theme.mode_due))
+                .padding(Padding::horizontal(1));
+
+            let calendar_lines = render_calendar(app.calendar_date, &app.theme);
+            let calendar_para = Paragraph::new(calendar_lines)
+                .alignment(Alignment::Center)
+                .block(popup_block);
+
+            frame.render_widget(calendar_para, popup_area);
+        }
         AppMode::ConfirmDelete | AppMode::ConfirmQuit => {
-            let popup_area = centered_rect(50, 25, frame.area());
+            let popup_area = centered_rect(44, 22, frame.area());
             frame.render_widget(Clear, popup_area);
 
             let prompt_msg = if app.mode == AppMode::ConfirmDelete {
-                "Are you sure you want to delete?"
+                "Delete this task?"
             } else {
-                "Are you sure you want to quit?"
+                "Quit todo app?"
             };
 
             let popup_block = Block::default()
-                .title(Span::styled(" Confirmation ", Style::default().fg(app.theme.mode_deleting)))
+                .title(Span::styled(" Confirm ", Style::default().fg(app.theme.mode_deleting).bold()))
+                .title_alignment(Alignment::Center)
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(app.theme.mode_deleting));
 
             let message = vec![
                 Line::from(""),
-                Line::from(prompt_msg.bold()),
-                Line::from("  [y] Yes  |  [n] Cancel  ".fg(app.theme.shortcut_hint)),
+                Line::from(Span::styled(prompt_msg, Style::default().bold())),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("y", Style::default().fg(app.theme.status_checked).bold()),
+                    Span::styled(" yes   ", Style::default().fg(app.theme.shortcut_hint)),
+                    Span::styled("n", Style::default().fg(app.theme.mode_deleting).bold()),
+                    Span::styled(" cancel", Style::default().fg(app.theme.shortcut_hint)),
+                ]),
             ];
 
             let popup_paragraph = Paragraph::new(message)
@@ -488,7 +669,7 @@ pub fn ui(frame: &mut Frame, app: &mut App, filtered_indices: &[usize]) {
             let query_len = app.search_query.chars().count();
             let cursor_offset = if query_len >= max_width { max_width - 1 } else { query_len };
 
-            let cursor_x = chunks[1].x + 8 + cursor_offset as u16;
+            let cursor_x = chunks[1].x + 9 + cursor_offset as u16;
             let cursor_y = chunks[1].y + 1;
             frame.set_cursor_position(Position::new(cursor_x, cursor_y));
         }
@@ -508,6 +689,7 @@ fn main() -> io::Result<()> {
         mode: AppMode::Normal,
         theme: Theme::load_or_default(),
         notifications_enabled: true,
+        calendar_date: Local::now().date_naive(),
     };
 
     let result = run_app(&mut terminal, &mut app);
@@ -529,7 +711,7 @@ fn run_app(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
 
         terminal.draw(|f| ui(f, app, &filtered_indices))?;
 
-        if event::poll(std::time::Duration::from_secs(1))? {
+        if event::poll(std::time::Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     let max_index = filtered_len.saturating_sub(1);
@@ -545,7 +727,7 @@ fn run_app(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
                             }
                             _ => {}
                         },
-                        AppMode::Adding | AppMode::Renaming | AppMode::SettingDueDate => match key.code {
+                        AppMode::Adding | AppMode::Renaming => match key.code {
                             KeyCode::Esc => {
                                 app.new_todo_query.clear();
                                 app.cursor_position = 0;
@@ -553,17 +735,7 @@ fn run_app(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
                             }
                             KeyCode::Enter => {
                                 let query_val = app.new_todo_query.trim().to_string();
-                                if app.mode == AppMode::SettingDueDate {
-                                    if let Some(&actual_idx) = filtered_indices.get(app.selected_index) {
-                                        app.todos[actual_idx].due_date = if query_val.is_empty() {
-                                            None
-                                        } else {
-                                            Some(query_val)
-                                        };
-                                        app.todos[actual_idx].notified = false;
-                                        app.save()?;
-                                    }
-                                } else if !query_val.is_empty() {
+                                if !query_val.is_empty() {
                                     if app.mode == AppMode::Adding {
                                         app.todos.push(Todo {
                                             text: query_val,
@@ -590,6 +762,48 @@ fn run_app(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
                             KeyCode::End => app.cursor_position = app.new_todo_query.chars().count(),
                             KeyCode::Backspace => app.delete_char(),
                             KeyCode::Char(c) => app.enter_char(c),
+                            _ => {}
+                        },
+                        AppMode::SettingDueDate => match key.code {
+                            KeyCode::Esc => {
+                                app.mode = AppMode::Normal;
+                            }
+                            KeyCode::Enter => {
+                                if let Some(&actual_idx) = filtered_indices.get(app.selected_index) {
+                                    app.todos[actual_idx].due_date = Some(app.calendar_date.format("%Y-%m-%d").to_string());
+                                    app.todos[actual_idx].notified = false;
+                                    app.save()?;
+                                }
+                                app.mode = AppMode::Normal;
+                            }
+                            KeyCode::Char('c') | KeyCode::Char('C') => {
+                                if let Some(&actual_idx) = filtered_indices.get(app.selected_index) {
+                                    app.todos[actual_idx].due_date = None;
+                                    app.todos[actual_idx].notified = false;
+                                    app.save()?;
+                                }
+                                app.mode = AppMode::Normal;
+                            }
+                            KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('H') => {
+                                if key.modifiers.contains(KeyModifiers::SHIFT) || key.code == KeyCode::Char('H') {
+                                    app.calendar_date = add_months(app.calendar_date, -1);
+                                } else {
+                                    app.calendar_date -= chrono::Duration::days(1);
+                                }
+                            }
+                            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('L') => {
+                                if key.modifiers.contains(KeyModifiers::SHIFT) || key.code == KeyCode::Char('L') {
+                                    app.calendar_date = add_months(app.calendar_date, 1);
+                                } else {
+                                    app.calendar_date += chrono::Duration::days(1);
+                                }
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                app.calendar_date -= chrono::Duration::days(7);
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                app.calendar_date += chrono::Duration::days(7);
+                            }
                             _ => {}
                         },
                         AppMode::ConfirmDelete => match key.code {
@@ -630,7 +844,7 @@ fn run_app(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
                                 }
                             }
                             KeyCode::Char('J') => {
-                                if filtered_len > 0 && app.selected_index < max_index {
+                                if app.search_query.is_empty() && filtered_len > 0 && app.selected_index < max_index {
                                     let current_actual_idx = filtered_indices[app.selected_index];
                                     let target_actual_idx = filtered_indices[app.selected_index + 1];
 
@@ -640,7 +854,7 @@ fn run_app(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
                                 }
                             }
                             KeyCode::Char('K') => {
-                                if filtered_len > 0 && app.selected_index > 0 {
+                                if app.search_query.is_empty() && filtered_len > 0 && app.selected_index > 0 {
                                     let current_actual_idx = filtered_indices[app.selected_index];
                                     let target_actual_idx = filtered_indices[app.selected_index - 1];
 
@@ -672,8 +886,15 @@ fn run_app(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
                             }
                             KeyCode::Char('D') => {
                                 if let Some(&actual_idx) = filtered_indices.get(app.selected_index) {
-                                    app.new_todo_query = app.todos[actual_idx].due_date.clone().unwrap_or_default();
-                                    app.cursor_position = app.new_todo_query.chars().count();
+                                    if let Some(ref d_str) = app.todos[actual_idx].due_date {
+                                        if let Ok(parsed) = NaiveDate::parse_from_str(d_str, "%Y-%m-%d") {
+                                            app.calendar_date = parsed;
+                                        } else {
+                                            app.calendar_date = Local::now().date_naive();
+                                        }
+                                    } else {
+                                        app.calendar_date = Local::now().date_naive();
+                                    }
                                     app.mode = AppMode::SettingDueDate;
                                 }
                             }
