@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Todo TUI
+Comment=Terminal-based To-Do List Manager
+Exec=todo
+Icon=todo
+Terminal=true
+Categories=Utility;Office;
